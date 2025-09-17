@@ -1,0 +1,20 @@
+{
+  "title_includes": {
+    "marketing": 10,
+    "growth": 10,
+    "demand": 10,
+    "vp": 15,
+    "chief": 20,
+    "head": 12,
+    "director": 12
+  },
+  "company_size_points": [
+    {"min": 1, "max": 49, "points": 5},
+    {"min": 50, "max": 199, "points": 10},
+    {"min": 200, "max": 999, "points": 20},
+    {"min": 1000, "max": 1000000, "points": 25}
+  ],
+  "country_boost": { "United States": 5 },
+  "source_boost": { "Product Signup": 15, "Website": 10, "LinkedIn": 8 },
+  "penalties": { "missing_company": -5 }
+}
