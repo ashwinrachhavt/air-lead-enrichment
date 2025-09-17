@@ -1,0 +1,18 @@
+[project]
+name = "air-lead-enrichment"
+version = "0.1.0"
+description = "Lead normalization, enrichment, and scoring API"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi==0.111.0",
+    "uvicorn==0.30.1",
+    "pydantic==2.7.4",
+    "python-multipart==0.0.9",
+    "pandas==2.2.2",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
