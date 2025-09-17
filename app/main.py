@@ -1,10 +1,11 @@
 import io
+import base64
 import json
 import logging
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
-from fastapi import Body, FastAPI, File, HTTPException, Request, Response, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from .models import BulkRequest, BulkResponse, LeadIn, LeadOut, Summary
 from .normalizer import canonical_email, dedupe_key, normalize_country, normalize_phone, normalize_source, parse_date, split_name, validate_email
@@ -45,25 +46,172 @@ def health() -> Dict[str, bool]:
     return {"ok": True}
 
 
+@app.get("/ui")
+def ui_page() -> HTMLResponse:
+    html = """
+    <!doctype html>
+    <html lang=\"en\">
+    <head>
+      <meta charset=\"utf-8\"/>
+      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
+      <title>Lead Enrichment</title>
+      <script src=\"https://cdn.tailwindcss.com\"></script>
+    </head>
+    <body class=\"bg-gray-50 min-h-screen flex items-center justify-center p-6\">
+      <div class=\"w-full max-w-2xl\">
+        <div class=\"bg-white shadow-xl rounded-xl p-8\">
+          <h1 class=\"text-2xl font-semibold text-gray-800 mb-2\">Lead CSV Cleaner</h1>
+          <p class=\"text-gray-500 mb-6\">Upload a CSV to normalize, enrich, score, and download a cleaned CSV.</p>
+          <form id=\"csvform\" class=\"space-y-5\" enctype=\"multipart/form-data\" method=\"post\" action=\"/ui/ingest\"> 
+            <input type=\"hidden\" name=\"column_map\" id=\"column_map\"> 
+            <div>
+              <label class=\"block text-sm font-medium text-gray-700 mb-1\">CSV File</label>
+              <div id=\"dropzone\" class=\"flex items-center justify-center w-full h-32 border-2 border-dashed rounded-lg bg-gray-50 hover:bg-gray-100 border-gray-300 cursor-pointer\">
+                <span class=\"text-gray-500 text-sm\">Drag & drop CSV here or click to select</span>
+                <input id=\"fileInput\" class=\"hidden\" type=\"file\" name=\"file\" accept=\".csv\" required>
+              </div>
+            </div>
+            <div class=\"flex items-center space-x-2\">
+              <input id=\"drop_invalid\" name=\"drop_invalid\" type=\"checkbox\" value=\"true\" class=\"h-4 w-4 text-indigo-600 border-gray-300 rounded\">
+              <label for=\"drop_invalid\" class=\"text-sm text-gray-700\">Drop invalid rows</label>
+            </div>
+            <div id=\"mapping\" class=\"space-y-3 hidden\"></div>
+            <div id=\"progressWrap\" class=\"hidden\">
+              <div class=\"w-full bg-gray-200 rounded-full h-2\">
+                <div id=\"progressBar\" class=\"bg-indigo-600 h-2 rounded-full\" style=\"width:0%\"></div>
+              </div>
+              <div id=\"progressText\" class=\"text-xs text-gray-500 mt-1\">0%</div>
+            </div>
+            <p class=\"text-xs text-gray-500\">Expected columns: Name, Email, Phone, Title, Company, Country, Created At, Source</p>
+            <div class=\"flex items-center space-x-3\">
+              <button type=\"submit\" class=\"inline-flex items-center px-4 py-2 bg-indigo-600 border border-transparent rounded-md font-medium text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500\">Upload and Clean</button>
+              <a href=\"/docs\" class=\"text-sm text-indigo-600 hover:underline\">API Docs</a>
+            </div>
+          </form>
+        </div>
+      </div>
+      <script>
+        const expected = [\"Name\",\"Email\",\"Phone\",\"Title\",\"Company\",\"Country\",\"Created At\",\"Source\"];
+        const dropzone = document.getElementById('dropzone');
+        const fileInput = document.getElementById('fileInput');
+        const mapping = document.getElementById('mapping');
+        const form = document.getElementById('csvform');
+        const colMapInput = document.getElementById('column_map');
+        const progressWrap = document.getElementById('progressWrap');
+        const progressBar = document.getElementById('progressBar');
+        const progressText = document.getElementById('progressText');
+        dropzone.addEventListener('click', () => fileInput.click());
+        dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('bg-gray-100'); });
+        dropzone.addEventListener('dragleave', e => { dropzone.classList.remove('bg-gray-100'); });
+        dropzone.addEventListener('drop', e => {
+          e.preventDefault(); dropzone.classList.remove('bg-gray-100');
+          if (e.dataTransfer.files && e.dataTransfer.files.length) {
+            fileInput.files = e.dataTransfer.files;
+            buildMappingFromFile(fileInput.files[0]);
+          }
+        });
+        fileInput.addEventListener('change', () => { if (fileInput.files[0]) buildMappingFromFile(fileInput.files[0]); });
+        function splitCsv(line) {
+          const parts = [];
+          let cur = '', inQ = false;
+          for (let i=0;i<line.length;i++) {
+            const ch = line[i];
+            if (ch === '"') { inQ = !inQ; continue; }
+            if (ch === ',' && !inQ) { parts.push(cur.trim().replace(/^\"|\"$/g,'')); cur=''; continue; }
+            cur += ch;
+          }
+          parts.push(cur.trim().replace(/^\"|\"$/g,''));
+          return parts;
+        }
+        function buildMappingFromFile(file) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const text = reader.result || '';
+            const firstLine = String(text).split(/\r?\n/)[0] || '';
+            const headers = splitCsv(firstLine);
+            buildMapping(headers);
+          };
+          reader.readAsText(file.slice(0, 2000));
+        }
+        function buildMapping(headers) {
+          mapping.innerHTML = '';
+          mapping.classList.remove('hidden');
+          expected.forEach(label => {
+            const key = label;
+            const wrap = document.createElement('div');
+            wrap.className = 'grid grid-cols-2 gap-3 items-center';
+            const l = document.createElement('label');
+            l.className = 'text-sm text-gray-700';
+            l.textContent = label + ' column';
+            const sel = document.createElement('select');
+            sel.className = 'mt-1 block w-full border border-gray-300 rounded-md p-2 text-sm';
+            const empty = document.createElement('option'); empty.value = ''; empty.textContent = '(auto)'; sel.appendChild(empty);
+            headers.forEach(h => { const o = document.createElement('option'); o.value = h; o.textContent = h; sel.appendChild(o); });
+            const match = headers.find(h => h.toLowerCase() === label.toLowerCase());
+            if (match) sel.value = match;
+            sel.dataset.key = key;
+            wrap.appendChild(l); wrap.appendChild(sel); mapping.appendChild(wrap);
+          });
+        }
+        form.addEventListener('submit', e => {
+          e.preventDefault();
+          if (!fileInput.files || !fileInput.files.length) { alert('Please choose a CSV'); return; }
+          const sels = mapping.querySelectorAll('select');
+          const m = {};
+          sels.forEach(s => { if (s.value) m[s.dataset.key.toLowerCase()] = s.value; });
+          colMapInput.value = Object.keys(m).length ? JSON.stringify(m) : '';
+          const xhr = new XMLHttpRequest();
+          xhr.open('POST', form.action);
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) {
+              const pct = Math.round((e.loaded / e.total) * 100);
+              progressWrap.classList.remove('hidden');
+              progressBar.style.width = pct + '%';
+              progressText.textContent = pct + '%';
+            }
+          };
+          xhr.onload = () => {
+            document.open(); document.write(xhr.responseText); document.close();
+          };
+          const fd = new FormData(form);
+          xhr.send(fd);
+        });
+      </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
 @app.get("/")
 def root() -> HTMLResponse:
     html = """
     <!doctype html>
-    <html>
+    <html lang=\"en\">
     <head>
       <meta charset=\"utf-8\"/>
+      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
       <title>Lead Enrichment</title>
-      <style>body{font-family:system-ui,Arial;margin:40px}form{margin-bottom:20px}label{display:block;margin:8px 0}input,select{padding:8px}button{padding:8px 12px} .hint{color:#666;font-size:12px}</style>
+      <script src=\"https://cdn.tailwindcss.com\"></script>
     </head>
-    <body>
-      <h1>Lead CSV Cleaner</h1>
-      <form id=\"csvform\" enctype=\"multipart/form-data\" method=\"post\" action=\"/ui/ingest\"> 
-        <label>CSV File <input type=\"file\" name=\"file\" accept=\".csv\" required/></label>
-        <label>Drop invalid <input type=\"checkbox\" name=\"drop_invalid\" value=\"true\"/></label>
-        <div class=\"hint\">Expected columns: Name, Email, Phone, Title, Company, Country, Created At, Source</div>
-        <button type=\"submit\">Upload & Clean</button>
-      </form>
-      <p>Or use the interactive API docs at <a href=\"/docs\">/docs</a>.</p>
+    <body class=\"bg-gray-50 min-h-screen flex items-center justify-center p-6\">
+      <div class=\"w-full max-w-2xl\">
+        <div class=\"bg-white shadow-xl rounded-xl p-8\">
+          <h1 class=\"text-2xl font-semibold text-gray-800 mb-2\">Lead CSV Cleaner</h1>
+          <p class=\"text-gray-500 mb-6\">Upload a CSV to normalize, enrich, score, and download a cleaned CSV.</p>
+          <form class=\"space-y-5\" enctype=\"multipart/form-data\" method=\"post\" action=\"/ui/ingest\">
+            <div>
+              <label class=\"block text-sm font-medium text-gray-700 mb-1\">CSV File</label>
+              <input class=\"block w-full text-sm text-gray-900 border border-gray-300 rounded-lg cursor-pointer bg-gray-50 focus:outline-none focus:ring-2 focus:ring-indigo-500\" type=\"file\" name=\"file\" accept=\".csv\" required>
+            </div>
+            <div class=\"flex items-center space-x-2\">
+              <input id=\"drop_invalid\" name=\"drop_invalid\" type=\"checkbox\" value=\"true\" class=\"h-4 w-4 text-indigo-600 border-gray-300 rounded\">
+              <label for=\"drop_invalid\" class=\"text-sm text-gray-700\">Drop invalid rows</label>
+            </div>
+            <p class=\"text-xs text-gray-500\">Expected columns: Name, Email, Phone, Title, Company, Country, Created At, Source</p>
+            <button type=\"submit\" class=\"inline-flex items-center px-4 py-2 bg-indigo-600 border border-transparent rounded-md font-medium text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500\">Upload and Clean</button>
+          </form>
+          <div class=\"mt-6 text-sm text-gray-500\">Use the interactive API at <a class=\"text-indigo-600 hover:underline\" href=\"/docs\">/docs</a>.</div>
+        </div>
+      </div>
     </body>
     </html>
     """
@@ -232,18 +380,59 @@ async def ingest_csv(file: UploadFile = File(...), drop_invalid: bool = False, c
 
 
 @app.post("/ui/ingest")
-async def ui_ingest(file: UploadFile = File(...), drop_invalid: Optional[str] = None) -> StreamingResponse:
+async def ui_ingest(file: UploadFile = File(...), drop_invalid: Optional[str] = None, column_map: Optional[str] = Form(None)) -> HTMLResponse:
     drop = drop_invalid == "true" or drop_invalid == "on"
-    res = await ingest_csv(file=file, drop_invalid=drop, column_map=None)
+    res = await ingest_csv(file=file, drop_invalid=drop, column_map=column_map)
     rows: List[Dict[str, Any]] = [r.model_dump(by_alias=True) for r in res.results]
-    if not rows:
-        rows = []
     df = pd.DataFrame(rows)
-    buf = io.StringIO()
-    df.to_csv(buf, index=False)
-    buf.seek(0)
-    headers = {"Content-Disposition": f"attachment; filename=cleaned_{int(time.time())}.csv"}
-    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv", headers=headers)
+    csv_buf = io.StringIO()
+    df.to_csv(csv_buf, index=False)
+    csv_buf.seek(0)
+    csv_data = csv_buf.getvalue().encode()
+    href = "data:text/csv;base64," + base64.b64encode(csv_data).decode()
+    s = res.summary
+    headers_html = ''.join(["<th class='px-3 py-2 text-left font-medium text-gray-700'>" + str(c) + "</th>" for c in df.columns])
+    rows_html = ''.join(['<tr>' + ''.join(["<td class='px-3 py-2 text-gray-700'>" + str(row.get(col)) + "</td>" for col in df.columns]) + '</tr>' for _, row in df.head(10).iterrows()])
+    html = f"""
+    <!doctype html>
+    <html lang=\"en\">
+    <head>
+      <meta charset=\"utf-8\"/>
+      <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
+      <title>Cleaned CSV</title>
+      <script src=\"https://cdn.tailwindcss.com\"></script>
+    </head>
+    <body class=\"bg-gray-50 min-h-screen flex items-center justify-center p-6\">
+      <div class=\"w-full max-w-3xl\">
+        <div class=\"bg-white shadow-xl rounded-xl p-8\">
+          <h1 class=\"text-2xl font-semibold text-gray-800 mb-4\">Cleaned CSV Ready</h1>
+          <div class=\"grid grid-cols-2 gap-4 text-sm text-gray-700\">
+            <div class=\"p-3 bg-gray-50 rounded\"><span class=\"font-medium\">Count In:</span> {s.count_in}</div>
+            <div class=\"p-3 bg-gray-50 rounded\"><span class=\"font-medium\">Count Out:</span> {s.count_out}</div>
+            <div class=\"p-3 bg-gray-50 rounded\"><span class=\"font-medium\">Dropped:</span> {s.dropped}</div>
+            <div class=\"p-3 bg-gray-50 rounded\"><span class=\"font-medium\">% Enriched:</span> {s.percent_enriched}</div>
+            <div class=\"p-3 bg-gray-50 rounded\"><span class=\"font-medium\">Avg Score:</span> {s.avg_score}</div>
+          </div>
+          <div class=\"mt-6 flex items-center space-x-3\">
+            <a href=\"{href}\" download=\"cleaned.csv\" class=\"inline-flex items-center px-4 py-2 bg-indigo-600 border border-transparent rounded-md font-medium text-white hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500\">Download Cleaned CSV</a>
+            <a href=\"/\" class=\"inline-flex items-center px-4 py-2 bg-gray-100 border border-gray-300 rounded-md font-medium text-gray-700 hover:bg-gray-200 focus:outline-none focus:ring-2 focus:ring-gray-300\">Back</a>
+            <a href=\"/docs\" class=\"inline-flex items-center px-4 py-2 bg-white border border-gray-300 rounded-md font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-gray-300\">API Docs</a>
+          </div>
+          <div class=\"mt-8\">
+            <h2 class=\"text-sm font-semibold text-gray-600 mb-2\">Preview</h2>
+            <div class=\"overflow-auto max-h-96 border rounded\">
+              <table class=\"min-w-full divide-y divide-gray-200 text-xs\">
+                <thead class=\"bg-gray-50\">{headers_html}</thead>
+                <tbody class=\"divide-y divide-gray-100\">{rows_html}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>
+    """
+    return HTMLResponse(html)
 
 
 def map_salesforce_row(r: LeadOut) -> Dict[str, Any]:
